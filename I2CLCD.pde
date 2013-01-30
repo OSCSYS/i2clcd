@@ -1,4 +1,4 @@
-#define BUILD 677
+#define BUILD 1007
 /*  
   Copyright (C) 2010 Jason von Nieda
 
@@ -25,29 +25,64 @@ Hardware Lead: Jeremiah Dillingham (jeremiah_AT_brewtroller_DOT_com)
 Documentation, Forums and more information available at http://www.brewtroller.com
 */
 
-#include <LiquidCrystal.h>
+#include <LiquidCrystalFP.h>
 #include <Wire.h>
 #include <EEPROM.h>
-#include "ByteBuffer.h"
-#include <util/atomic.h>
+#include <pin.h>
+#include <encoder.h>
+  
+//#define I2CLCD_VERSION 1
+#define I2CLCD_VERSION 2
 
-#define LCDRS_PIN 3
-#define LCDENABLE_PIN 4
-#define LCDDATA1_PIN 5
-#define LCDDATA2_PIN 6
-#define LCDDATA3_PIN 7
-#define LCDDATA4_PIN 8
-#define LCDDATA5_PIN 9
-#define LCDDATA6_PIN 14
-#define LCDDATA7_PIN 15
-#define LCDDATA8_PIN 16
-#define LCDBRIGHT_PIN 10
-#define LCDCONTRAST_PIN 11
-#define DEBUG_PIN 13
+#if I2CLCD_VERSION == 1
+  #define LCD_8BIT
+  #define LCDRS_PIN 3
+  #define LCDENABLE_PIN 4
+  #define LCDDATA1_PIN 5
+  #define LCDDATA2_PIN 6
+  #define LCDDATA3_PIN 7
+  #define LCDDATA4_PIN 8
+  #define LCDDATA5_PIN 9
+  #define LCDDATA6_PIN 14
+  #define LCDDATA7_PIN 15
+  #define LCDDATA8_PIN 16
+  #define LCDBRIGHT_PIN 10
+  #define LCDCONTRAST_PIN 11
+  #define DEBUG_PIN 13
+#elif I2CLCD_VERSION == 2
+  #define LCD_4BIT
+  #define LCDRS_PIN 3
+  #define LCDENABLE_PIN 4
+  #define LCDDATA5_PIN 5
+  #define LCDDATA6_PIN 6
+  #define LCDDATA7_PIN 7
+  #define LCDDATA8_PIN 8
+  #define LCDBRIGHT_PIN 10
+  #define LCDCONTRAST_PIN 11
+  #define DEBUG_PIN 13
+  #define ENCODER_SUPPORT
+  #define ENCODER_TYPE CUI
+  #define ENCODER_ACTIVELOW
+  #define ENCA_PIN 14
+  #define ENCB_PIN 15
+  #define ENTER_PIN 16
+#endif
 
-#define REQ_BRIGHT 0
-#define REQ_CONTRAST 1
-#define NUM_REQ 2
+typedef enum {
+  REQ_BRIGHT,
+  REQ_CONTRAST,
+  REQ_VERSION,
+#ifdef ENCODER_SUPPORT
+  REQ_ENCCOUNT,
+  REQ_ENCCHANGE,
+  REQ_ENCDELTA,
+  REQ_ENCENTERSTATE,
+  REQ_ENCOK,
+  REQ_ENCCANCEL,
+#endif
+  NUM_REQ
+} RequestType;
+
 
 #define EEPROM_FINGERPRINT0 0
 #define EEPROM_FINGERPRINT1 1
@@ -58,12 +93,16 @@ Documentation, Forums and more information available at http://www.brewtroller.c
 
 #define FINGER0 123
 #define FINGER1 46
-#define DEFAULT_BRIGHT 192
-#define DEFAULT_CONTRAST 64
+#define DEFAULT_BRIGHT 100
+#define DEFAULT_CONTRAST 100
 #define DEFAULT_ROWS 4
 #define DEFAULT_COLS 20
 
-LiquidCrystal lcd(LCDRS_PIN, LCDENABLE_PIN, LCDDATA1_PIN, LCDDATA2_PIN, LCDDATA3_PIN, LCDDATA4_PIN, LCDDATA5_PIN, LCDDATA6_PIN, LCDDATA7_PIN, LCDDATA8_PIN);
+#if defined LCD_8BIT
+  LiquidCrystal lcd(LCDRS_PIN, LCDENABLE_PIN, LCDDATA1_PIN, LCDDATA2_PIN, LCDDATA3_PIN, LCDDATA4_PIN, LCDDATA5_PIN, LCDDATA6_PIN, LCDDATA7_PIN, LCDDATA8_PIN);
+#elif defined LCD_4BIT
+  LiquidCrystal lcd(LCDRS_PIN, LCDENABLE_PIN, LCDDATA5_PIN, LCDDATA6_PIN, LCDDATA7_PIN, LCDDATA8_PIN);
+#endif
 
 byte i2cAddr = 0x01;
 byte brightness = 0;
@@ -71,145 +110,213 @@ byte contrast = 255;
 byte rows = 4;
 byte cols = 20;
 byte reqField = REQ_BRIGHT;
-ByteBuffer i2cBuffer;
 
-void setup() {
-  pinMode(LCDBRIGHT_PIN, OUTPUT);
-  pinMode(LCDCONTRAST_PIN, OUTPUT);
-  pinMode(DEBUG_PIN, OUTPUT);
-  
-  //Change PWM Freq for smooth contrast/brightness
-  TCCR1B = 0x01;   // Timer 1: PWM 9 & 10 @ 32 kHz
-  TCCR2B = 0x01;   // Timer 2: PWM 3 & 11 @ 32 kHz
-
-  loadEEPROM();
-  
-  //Serial.begin(115200);
-  
-  i2cBuffer.init(128);
-
-  lcd.begin(cols, rows);
-  lcd.setCursor(0, 0);
-  lcd.print("I2CLCD");
-  lcd.setCursor(0, 1);
-  lcd.print("Build ");
-  lcd.print(BUILD, DEC);
-  lcd.setCursor(0, 2);
-  lcd.print("Address: 0x");
-  lcd.print(i2cAddr, HEX);
-  
-  Wire.onReceive(onReceive);
-  Wire.onRequest(onRequest);
-  Wire.begin(i2cAddr);
-}
-
-void loop() {
-  /**
-  * Each time through the loop we make an atomic copy of the I2C buffer
-  * and then process any commands that are in it. This allows I2C receive
-  * happen quickly to avoid overflows and allows us to process commands
-  * in the "background". 
-  */
-  
-  byte buffer[128];
-  byte length;
-  byte *p = buffer;
-  
-  memset(buffer, 0, 128);
-  
-  ATOMIC_BLOCK(ATOMIC_FORCEON) {
-    length = (byte) i2cBuffer.getSize();
-  }
-  
-  for (byte i = 0; i < length; i++) {
-    buffer[i] = i2cBuffer.get();
-  }
-
-  while ((p - buffer) < length) {
-    if ((p[0] >= 0x01 && p[0] <= 0x0C) || p[0] == 0x14) digitalWrite(DEBUG_PIN, HIGH);
-    if (p[0] == 0x01) { // begin(cols, rows)
-      cols = p[1];
-      rows = p[2];
-      lcd.begin(cols, rows);
-      p += 2;
-    }
-    else if (p[0] == 0x02) // clear
-      lcd.clear();
-    else if (p[0] == 0x03) // setCursor(col, row)
-    {
-      lcd.setCursor(p[1], p[2]);
-      p += 2;
-    }
-    else if (p[0] == 0x04) // print(col, row, char* s)
-    {
-      lcd.setCursor(p[1], p[2]);
-      lcd.print((char *) &p[3]);
-      p += 2 + strlen((char *) &p[3]) + 1;
-    }
-    else if (p[0] == 0x05) // setCustChar(slot, unsigned char data[8])
-    {
-      lcd.createChar(p[1], &p[2]);
-      p += 1 + 8;
-    }
-    else if (p[0] == 0x06) // writeCustChar(col, row, slot)
-    {
-      lcd.setCursor(p[1], p[2]);
-      lcd.write(p[3]);
-      p += 3;
-    }
-    else if (p[0] == 0x07) // setBright(value)
-    {
-      p++;
-      if (brightness != *p) {
-        setBright(*p);
-        //delay(10);
-      }
-    }
-    else if (p[0] == 0x08) // setContrast(value)
-    {
-      p++;
-      if (contrast != *p) {
-        setContrast(*p++);
-        //delay(10);
-      }
-    }
-    else if (p[0] == 0x09) // getBright(value)
-    {
-      reqField = REQ_BRIGHT;
-      delay(10);
-    }
-    else if (p[0] == 0x0A) // getContrast(value)
-    {
-      reqField = REQ_CONTRAST;
-      delay(10);
-    }
-    else if (p[0] == 0x0B) saveEEPROM();
-    else if (p[0] == 0x0C) loadEEPROM();
-    
-    else if (p[0] == 0x14) // write(col, row, len, char* s)
-    {
-      lcd.setCursor(p[1], p[2]);
-      byte len = min(p[3], 20 - p[1]); //Do not overwrite row length (20)
-      for (byte i = 0; i < len; i++) lcd.write(p[4 + i]);
-      p += p[3] + 3;
-    }
-
-    // increment for the command byte that was read
-    p++;
-    digitalWrite(DEBUG_PIN, LOW);
-  }
-}
+#ifdef DEBUG_PIN
+  pin debug;
+#endif
 
 void onReceive(int numBytes) {
-  for (byte i = 0; i < numBytes; i++) {
-    i2cBuffer.put(Wire.receive());
+#ifdef DEBUG_PIN
+  debug.set();
+#endif
+  switch (Wire.receive()) {
+    case 0x01: // begin(cols, rows)
+      cols = Wire.receive();
+      rows = Wire.receive();
+      lcd.begin(cols, rows);
+      break;
+    case 0x02: // clear
+      lcd.clear();
+      break;
+    case 0x03: // setCursor(col, row)
+      {
+          byte c = Wire.receive();
+          byte r = Wire.receive();
+          lcd.setCursor(c, r);
+      }
+      break;
+    case 0x04: // print(col, row, char* s)
+      {
+        byte c = Wire.receive();
+        byte r = Wire.receive();
+        lcd.setCursor(c, r);
+        while (Wire.available()) lcd.write(Wire.receive());
+      }
+      break;
+    case 0x05: // setCustChar(slot, unsigned char data[8])
+    {
+      byte s = Wire.receive();
+      byte c[8];
+      for (byte i = 0; i < 8; i++) c[i] = Wire.receive();
+      lcd.createChar(s, c);
+      break;
+    }
+    case 0x06: // writeCustChar(col, row, slot)
+      {
+        byte c = Wire.receive();
+        byte r = Wire.receive();
+        lcd.setCursor(c, r);
+        lcd.write(Wire.receive());
+      }
+      break;
+    case 0x07: // setBright(value)
+      {
+        byte b = Wire.receive();
+        if (brightness != b) {
+          setBright(b);
+        }
+      }
+      break;
+    case 0x08: // setContrast(value)
+      {
+        byte c = Wire.receive();
+        if (contrast != c) {
+          setContrast(c);
+        }
+      }
+      break;
+    case 0x09: // getBright(value)
+      reqField = REQ_BRIGHT;
+      break;
+    case 0x0A: // getContrast(value)
+      reqField = REQ_CONTRAST;
+      break;
+    case 0x0B:
+      saveEEPROM();
+      break;
+    case 0x0C: 
+      loadEEPROM();
+      break;
+    case 0x14: // write(col, row, len, char* s)
+      {
+        byte c = Wire.receive();
+        byte r = Wire.receive();
+        lcd.setCursor(c, r);
+        byte len = min(Wire.receive(), 20 - c); //Do not overwrite row length (20)
+        for (byte i = 0; i < len; i++) lcd.write(Wire.receive());
+      }
+      break;
+    case 0x15: // write(char c)
+      lcd.write(Wire.receive());
+      break;
+    case 0x16: // getVersion()
+      reqField = REQ_VERSION;
+      break;
+    case 0x17: //cursor/no cursor
+      { Wire.receive() ? lcd.cursor() : lcd.noCursor(); }
+      break;
+    case 0x18: //blink/no blink
+      { Wire.receive() ? lcd.blink() : lcd.noBlink(); }
+      break;
+      
+      
+#ifdef ENCODER_SUPPORT
+    case 0x40: //Encoder.setMin
+      {
+        int val = Wire.receive();
+        val = (val<<8) + Wire.receive();
+        Encoder.setMin(val);
+      }
+      break;
+    case 0x41: //Encoder.setMax
+      {
+        int val = Wire.receive();
+        val = (val<<8) + Wire.receive();
+        Encoder.setMax(val);
+      }
+      break;
+    case 0x42: //Encoder.setWrap
+      Encoder.setWrap((bool) Wire.receive());
+      break;
+    case 0x43: //Encoder.setCount
+      {
+        int val = Wire.receive();
+        val = (val<<8) + Wire.receive();
+        Encoder.setCount(val);
+      }
+      break;
+    case 0x44: //Encoder.clearCount
+      Encoder.clearCount();
+      break;
+    case 0x45: //Encoder.clearEnterState
+      Encoder.clearEnterState();
+      break;
+    case 0x46: // Encoder.getCount
+      reqField = REQ_ENCCOUNT;
+      break;
+    case 0x47: // Encoder.change
+      reqField = REQ_ENCCHANGE;
+      break;
+    case 0x48: // Encoder.getDelta
+      reqField = REQ_ENCDELTA;
+      break;
+    case 0x49: // Encoder.getEnterState
+      reqField = REQ_ENCENTERSTATE;
+      break;
+    case 0x4A: // Encoder.ok
+      reqField = REQ_ENCOK;
+      break;
+    case 0x4B: // Encoder.cancel
+      reqField = REQ_ENCCANCEL;
+      break;
+#endif
   }
+#ifdef DEBUG_PIN
+  debug.clear();
+#endif
 }
 
 void onRequest() {
-  if (reqField == REQ_BRIGHT) Wire.send(brightness);
-  else if (reqField == REQ_CONTRAST) Wire.send(contrast);
-  else Wire.send(1);
+  switch (reqField) {
+    case REQ_BRIGHT:
+      Wire.send(brightness);
+      break;
+    case REQ_CONTRAST:
+      Wire.send(contrast);
+      break;
+    case REQ_VERSION:
+      {
+        int value = BUILD;
+        uint8_t * p = (uint8_t *) &value;
+        Wire.send(p, 2);
+      }
+      break;
+#ifdef ENCODER_SUPPORT
+    case REQ_ENCCOUNT:
+      {
+        int value = Encoder.getCount();
+        uint8_t * p = (uint8_t *) &value;
+        Wire.send(p, 2);
+      }
+      break;
+    case REQ_ENCCHANGE:
+      {
+        int value = Encoder.change();
+        uint8_t * p = (uint8_t *) &value;
+        Wire.send(p, 2);
+      }
+      break;
+    case REQ_ENCDELTA:
+      {
+        int value = Encoder.getDelta();
+        uint8_t * p = (uint8_t *) &value;
+        Wire.send(p, 2);
+      }
+      break;  
+    case REQ_ENCENTERSTATE:
+      Wire.send(Encoder.getEnterState());
+      break;
+    case REQ_ENCOK:
+      Wire.send(Encoder.ok());
+      break;
+    case REQ_ENCCANCEL:
+      Wire.send(Encoder.cancel());
+      break;
+#endif
+    default:
+      Wire.send(255);
+      break;
+  }
   reqField++;
   if (reqField >= NUM_REQ) reqField = 0;
 }
@@ -260,4 +367,40 @@ void loadEEPROM() {
   }
 }
 
+void setup() {
+  pinMode(LCDBRIGHT_PIN, OUTPUT);
+  pinMode(LCDCONTRAST_PIN, OUTPUT);
+#ifdef DEBUG_PIN
+  debug.setup(DEBUG_PIN, OUTPUT);
+#endif
+  
+  //Change PWM Freq for smooth contrast/brightness
+  TCCR1B = 0x01;   // Timer 1: PWM 9 & 10 @ 32 kHz
+  TCCR2B = 0x01;   // Timer 2: PWM 3 & 11 @ 32 kHz
 
+#ifdef ENCODER_SUPPORT
+  Encoder.begin(ENCODER_TYPE, ENTER_PIN, ENCA_PIN, ENCB_PIN);
+  #ifdef ENCODER_ACTIVELOW
+    Encoder.setActiveLow(1);
+  #endif
+#endif
+  loadEEPROM();
+  
+  lcd.begin(cols, rows);
+  lcd.setCursor(0, 0);
+  lcd.print("I2CLCD");
+  lcd.setCursor(0, 1);
+  lcd.print("Build ");
+  lcd.print(BUILD, DEC);
+  lcd.setCursor(0, 2);
+  lcd.print("Address: 0x");
+  lcd.print(i2cAddr, HEX);
+  
+  Wire.onReceive(onReceive);
+  Wire.onRequest(onRequest);
+  Wire.begin(i2cAddr);
+}
+
+void loop() {
+ 
+}
